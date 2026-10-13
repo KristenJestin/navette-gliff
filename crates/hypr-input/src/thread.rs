@@ -160,13 +160,16 @@ impl State {
         Ok(())
     }
 
+    /// Every key and button held goes up; Caps Lock and Num Lock stay as
+    /// they are, as on a real keyboard.
     fn release_all(&mut self) {
         let t = now_ms();
-        for code in std::mem::take(&mut self.pressed_keys) {
+        let held = std::mem::take(&mut self.pressed_keys);
+        for &code in &held {
             self.keyboard.key(t, code, 0);
         }
-        self.keys.reset();
-        self.keyboard.modifiers(0, 0, 0, 0);
+        let (dep, lat, lock, group) = self.keys.release(held);
+        self.keyboard.modifiers(dep, lat, lock, group);
         for b in std::mem::take(&mut self.pressed_buttons) {
             self.pointer.button(t, b, wl_pointer::ButtonState::Released);
         }
@@ -250,6 +253,10 @@ impl LoopState for State {
                 Err(e) => self.emit(InputEvent::Error(e.to_string())),
             },
             InputCmd::SetExtent { width, height } => self.extent = (width.max(1), height.max(1)),
+            InputCmd::SetLocked(names) => {
+                let (dep, lat, lock, group) = self.keys.set_locked(&names);
+                self.keyboard.modifiers(dep, lat, lock, group);
+            }
             InputCmd::ReleaseAll => self.release_all(),
             InputCmd::Stop => self.stop(),
         }

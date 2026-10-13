@@ -95,6 +95,10 @@ pub enum InputCmd {
         width: u32,
         height: u32,
     },
+    /// Lock exactly these modifiers, by xkb name (`Lock` for Caps Lock,
+    /// `Mod2` for Num Lock), to match another keyboard's locks.
+    SetLocked(Vec<String>),
+    /// Every key and button held goes up; the locks stay.
     ReleaseAll,
     Stop,
 }
