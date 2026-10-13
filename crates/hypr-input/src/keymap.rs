@@ -149,9 +149,42 @@ impl KeyState {
         )
     }
 
-    pub fn reset(&mut self) {
-        self.state = xkb::State::new(&self.keymap);
-        self.last_mods = (0, 0, 0, 0);
+    /// Release the `held` keys: what they hold down goes up, what they
+    /// locked (Caps Lock, Num Lock) stays locked. Returns the resulting
+    /// `(depressed, latched, locked, group)`.
+    pub fn release(&mut self, held: impl IntoIterator<Item = u32>) -> (u32, u32, u32, u32) {
+        for code in held {
+            self.state.update_key(
+                xkb::Keycode::new(code.saturating_add(8)),
+                xkb::KeyDirection::Up,
+            );
+        }
+        self.last_mods = self.mods();
+        self.last_mods
+    }
+
+    /// Lock exactly the modifiers named (xkb names: `Lock` for Caps Lock,
+    /// `Mod2` for Num Lock) that this keymap has, and unlock the others;
+    /// what is held and the layout stay. Returns the resulting
+    /// `(depressed, latched, locked, group)`.
+    pub fn set_locked(&mut self, names: &[String]) -> (u32, u32, u32, u32) {
+        let mut locked = 0;
+        for name in names {
+            let index = self.keymap.mod_get_index(name);
+            if index != xkb::MOD_INVALID && index < 32 {
+                locked |= 1 << index;
+            }
+        }
+        self.state.update_mask(
+            self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            self.state.serialize_mods(xkb::STATE_MODS_LATCHED),
+            locked,
+            self.state.serialize_layout(xkb::STATE_LAYOUT_DEPRESSED),
+            self.state.serialize_layout(xkb::STATE_LAYOUT_LATCHED),
+            self.state.serialize_layout(xkb::STATE_LAYOUT_LOCKED),
+        );
+        self.last_mods = self.mods();
+        self.last_mods
     }
 }
 
@@ -202,6 +235,34 @@ mod tests {
             .expect("caps press changes mods");
         assert_eq!(mods.0, control);
         assert_eq!(mods.2, 0);
+    }
+
+    #[test]
+    fn release_lets_go_of_held_keys_and_keeps_the_locks() {
+        const KEY_CAPSLOCK: u32 = 58;
+        const KEY_LEFTSHIFT: u32 = 42;
+        let mut ks = KeyState::default_us().unwrap();
+        ks.update(KEY_CAPSLOCK, true);
+        ks.update(KEY_CAPSLOCK, false);
+        ks.update(KEY_LEFTSHIFT, true);
+        let lock = 1 << ks.keymap.mod_get_index(xkb::MOD_NAME_CAPS);
+        let (depressed, _, locked, _) = ks.release([KEY_LEFTSHIFT]);
+        assert_eq!((depressed, locked), (0, lock));
+    }
+
+    #[test]
+    fn locks_are_set_by_name() {
+        let mut ks = KeyState::default_us().unwrap();
+        let lock = 1 << ks.keymap.mod_get_index(xkb::MOD_NAME_CAPS);
+        let num = 1 << ks.keymap.mod_get_index(xkb::MOD_NAME_NUM);
+        let names = [
+            "Lock".to_string(),
+            "Mod2".to_string(),
+            "NoSuchMod".to_string(),
+        ];
+        assert_eq!(ks.set_locked(&names).2, lock | num);
+        assert_eq!(ks.set_locked(&["Mod2".to_string()]).2, num);
+        assert_eq!(ks.set_locked(&[]).2, 0);
     }
 
     #[test]
