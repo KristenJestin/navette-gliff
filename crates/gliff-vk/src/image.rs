@@ -15,6 +15,42 @@ use crate::{Error, Result};
 pub const NV12: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 pub const LINEAR_MODIFIER: u64 = 0;
 
+/// How the display image is used: the recombine writes it, the readback
+/// copies from it.
+pub(crate) const DISPLAY_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::STORAGE.as_raw() | vk::ImageUsageFlags::TRANSFER_SRC.as_raw(),
+);
+/// The display image is BGRA memory the shader stores to through an RGBA
+/// view (see recombine.comp).
+pub(crate) const DISPLAY_VIEW_FORMATS: [vk::Format; 2] =
+    [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM];
+
+/// Whether a display image with `modifier` can be written and exported,
+/// given the driver's modifiers for its BGRA memory and its RGBA view: one
+/// memory plane, so one dmabuf describes it, copies out of the BGRA image,
+/// and shader stores through the RGBA view.
+pub(crate) fn writable_display(
+    modifier: u64,
+    bgra: &[vk::DrmFormatModifierPropertiesEXT],
+    rgba: &[vk::DrmFormatModifierPropertiesEXT],
+) -> bool {
+    let find = |list: &[vk::DrmFormatModifierPropertiesEXT]| {
+        list.iter()
+            .find(|p| p.drm_format_modifier == modifier)
+            .copied()
+    };
+    let (Some(bgra), Some(rgba)) = (find(bgra), find(rgba)) else {
+        return false;
+    };
+    bgra.drm_format_modifier_plane_count == 1
+        && bgra
+            .drm_format_modifier_tiling_features
+            .contains(vk::FormatFeatureFlags::TRANSFER_SRC)
+        && rgba
+            .drm_format_modifier_tiling_features
+            .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+}
+
 /// A dmabuf plane description shared with the capture and display sides.
 pub struct DmabufPlane<'a> {
     pub fd: BorrowedFd<'a>,
@@ -108,16 +144,21 @@ impl Image {
         Ok(img)
     }
 
-    /// Create a BGRA image whose memory is exportable as a linear dmabuf
-    /// (the client's display output).
-    pub(crate) fn exportable_bgra(gpu: &Arc<Gpu>, width: u32, height: u32) -> Result<Self> {
-        let modifiers = [LINEAR_MODIFIER];
+    /// Create a BGRA image whose memory is exportable as a dmabuf (the
+    /// client's display output), with one of `modifiers`, as the driver
+    /// chooses.
+    pub(crate) fn exportable_bgra(
+        gpu: &Arc<Gpu>,
+        width: u32,
+        height: u32,
+        modifiers: &[u64],
+    ) -> Result<Self> {
         let mut mod_list =
-            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&modifiers);
+            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(modifiers);
         let mut external = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let view_formats = [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM];
-        let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+        let mut format_list =
+            vk::ImageFormatListCreateInfo::default().view_formats(&DISPLAY_VIEW_FORMATS);
         let info = vk::ImageCreateInfo::default()
             .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
             .image_type(vk::ImageType::TYPE_2D)
@@ -131,7 +172,7 @@ impl Image {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC)
+            .usage(DISPLAY_USAGE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut mod_list)
             .push_next(&mut external)
@@ -246,7 +287,7 @@ impl Image {
         )
     }
 
-    /// Export the (linear, single-plane) image as a dmabuf for another API.
+    /// Export the single-plane image as a dmabuf for another API.
     pub fn export_dmabuf(&self) -> Result<ExportedDmabuf> {
         // SAFETY: the memory was allocated exportable; the fd is owned by us.
         unsafe {
@@ -631,7 +672,19 @@ impl Image {
         self.foreign_barrier(cmd, self.gpu.foreign_family, self.gpu.families.compute, new);
     }
 
-    /// Hand the image to another API (VA-API) to read, contents kept.
+    /// Take an exported display image back from the display side (the
+    /// compositor) before using it, in GENERAL layout; it is handed out again
+    /// with [`Self::release_foreign`]. A fresh image was never handed out.
+    pub(crate) fn acquire_display(&self, cmd: vk::CommandBuffer) {
+        if self.layout.get() == vk::ImageLayout::UNDEFINED {
+            self.transition(cmd, vk::ImageLayout::GENERAL);
+        } else {
+            self.acquire_foreign(cmd, vk::ImageLayout::GENERAL);
+        }
+    }
+
+    /// Hand the image to another API (VA-API, or a compositor for a display
+    /// image) to read, contents kept.
     pub(crate) fn release_foreign(&self, cmd: vk::CommandBuffer) {
         self.foreign_barrier(
             cmd,
@@ -757,7 +810,7 @@ impl Drop for Image {
     }
 }
 
-/// A dmabuf handed to another API (GTK), describing one linear plane.
+/// A dmabuf handed to another API (GTK), describing one plane.
 #[derive(Debug)]
 pub struct ExportedDmabuf {
     pub fd: OwnedFd,
@@ -1000,5 +1053,48 @@ mod tests {
         assert!(matches!(one_memory_plane, Err(Error::Unsupported(_))));
         let unknown_modifier = nv12_binding(2, &[0, 1], NVIDIA_BLOCK_LINEAR, None);
         assert!(matches!(unknown_modifier, Err(Error::Unsupported(_))));
+    }
+
+    fn display(
+        features: vk::FormatFeatureFlags,
+        planes: u32,
+    ) -> vk::DrmFormatModifierPropertiesEXT {
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: NVIDIA_BLOCK_LINEAR,
+            drm_format_modifier_plane_count: planes,
+            drm_format_modifier_tiling_features: features,
+        }
+    }
+
+    fn written() -> vk::FormatFeatureFlags {
+        vk::FormatFeatureFlags::STORAGE_IMAGE | vk::FormatFeatureFlags::TRANSFER_SRC
+    }
+
+    #[test]
+    fn a_tiled_display_image_the_shader_writes_is_kept() {
+        let (bgra, rgba) = ([display(written(), 1)], [display(written(), 1)]);
+        assert!(writable_display(NVIDIA_BLOCK_LINEAR, &bgra, &rgba));
+    }
+
+    #[test]
+    fn a_display_modifier_with_a_second_memory_plane_is_refused() {
+        let (bgra, rgba) = ([display(written(), 2)], [display(written(), 2)]);
+        assert!(!writable_display(NVIDIA_BLOCK_LINEAR, &bgra, &rgba));
+    }
+
+    #[test]
+    fn a_display_modifier_the_shader_cannot_store_to_is_refused() {
+        let bgra = [display(written(), 1)];
+        let rgba = [display(sampled(), 1)];
+        assert!(!writable_display(NVIDIA_BLOCK_LINEAR, &bgra, &rgba));
+        let unreadable = [display(vk::FormatFeatureFlags::STORAGE_IMAGE, 1)];
+        assert!(!writable_display(NVIDIA_BLOCK_LINEAR, &unreadable, &bgra));
+    }
+
+    #[test]
+    fn a_display_modifier_the_driver_does_not_list_is_refused() {
+        let (bgra, rgba) = ([display(written(), 1)], [display(written(), 1)]);
+        assert!(!writable_display(LINEAR_MODIFIER, &bgra, &rgba));
+        assert!(!writable_display(NVIDIA_BLOCK_LINEAR, &bgra, &[]));
     }
 }
