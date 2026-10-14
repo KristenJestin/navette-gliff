@@ -34,6 +34,8 @@ struct State {
     pressed_keys: BTreeSet<u32>,
     pressed_buttons: BTreeSet<u32>,
     extent: (u32, u32),
+    /// The output's logical size, which `Relative` is scaled to.
+    output_size: (u32, u32),
     quit: bool,
 }
 
@@ -90,6 +92,7 @@ fn run(
         pressed_keys: BTreeSet::new(),
         pressed_buttons: BTreeSet::new(),
         extent: (1, 1),
+        output_size: (1, 1),
         quit: false,
     };
     std::mem::swap(&mut state.sink, sink);
@@ -132,6 +135,7 @@ fn input_loop(
 
     let (output, info) = state.outputs.find(&cfg.output)?;
     state.extent = info.logical_size();
+    state.output_size = state.extent;
     let bound = ptr_mgr.create_virtual_pointer_with_output(Some(seat_proxy), Some(&output), qh, ());
     let old = std::mem::replace(&mut state.pointer, bound);
     old.destroy();
@@ -199,6 +203,11 @@ impl LoopState for State {
                 let xi = x.clamp(0.0, (w.saturating_sub(1)) as f64).round() as u32;
                 let yi = y.clamp(0.0, (h.saturating_sub(1)) as f64).round() as u32;
                 self.pointer.motion_absolute(t, xi, yi, w, h);
+                self.pointer.frame();
+            }
+            InputCmd::Relative { dx, dy } => {
+                let (dx, dy) = to_output((dx, dy), self.extent, self.output_size);
+                self.pointer.motion(t, dx, dy);
                 self.pointer.frame();
             }
             InputCmd::Button { button, pressed } => {
@@ -272,6 +281,15 @@ impl LoopState for State {
     }
 }
 
+/// A delta in the extent's units, in the output's logical pixels, as an
+/// absolute `Motion` to the same place would move.
+fn to_output(delta: (f64, f64), extent: (u32, u32), output: (u32, u32)) -> (f64, f64) {
+    (
+        delta.0 * f64::from(output.0) / f64::from(extent.0),
+        delta.1 * f64::from(output.1) / f64::from(extent.1),
+    )
+}
+
 impl Dispatch<WlRegistry, GlobalListContents> for State {
     fn event(
         _: &mut Self,
@@ -314,3 +332,21 @@ delegate_noop!(State: ZwpVirtualKeyboardManagerV1);
 delegate_noop!(State: ZwpVirtualKeyboardV1);
 delegate_noop!(State: ZwlrVirtualPointerManagerV1);
 delegate_noop!(State: ZwlrVirtualPointerV1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_motion_is_scaled_from_the_extent_to_the_output() {
+        assert_eq!(
+            to_output((10.0, -4.0), (1280, 720), (1280, 720)),
+            (10.0, -4.0)
+        );
+        // The caller's extent is twice the output's logical size (a scale of 2 here).
+        assert_eq!(
+            to_output((10.0, -4.0), (2560, 1440), (1280, 720)),
+            (5.0, -2.0)
+        );
+    }
+}

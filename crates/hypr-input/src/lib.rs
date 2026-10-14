@@ -78,6 +78,14 @@ pub enum InputCmd {
         x: f64,
         y: f64,
     },
+    /// Relative pointer motion, in the same units as `Motion`. A client
+    /// that locks or confines the pointer (a 3D view's orbit, a game) sees
+    /// only relative motion: an absolute `Motion` sends it none. Send it
+    /// before the `Motion` that ends at the same place.
+    Relative {
+        dx: f64,
+        dy: f64,
+    },
     /// `button` is an evdev `BTN_*` code.
     Button {
         button: u32,
