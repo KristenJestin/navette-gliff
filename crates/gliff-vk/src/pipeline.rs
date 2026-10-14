@@ -427,9 +427,9 @@ impl Decoder {
                 if let Some(a) = aux_img {
                     a.acquire_foreign(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 }
-                dst.transition(cmd, vk::ImageLayout::GENERAL);
+                dst.acquire_display(cmd);
                 recombine.record(cmd, main_img, aux_img, dst, (w, h), zoom)?;
-                dst.memory_barrier(cmd);
+                dst.release_foreign(cmd);
                 main_img.release_foreign(cmd);
                 if let Some(a) = aux_img {
                     a.release_foreign(cmd);
@@ -487,7 +487,9 @@ impl Decoder {
         let buf = self.readback.as_ref().expect("allocated above");
         self.compute
             .run(self.timeline.semaphore, None, None, true, |cmd| {
+                image.acquire_display(cmd);
                 image.copy_rgba_to_buffer(cmd, buf);
+                image.release_foreign(cmd);
                 Ok(())
             })?;
         Ok(Some(buf.read(0, size)))
@@ -558,9 +560,9 @@ impl Decoder {
                 if let Some(a) = aux_img {
                     a.acquire_foreign(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 }
-                dst.transition(cmd, vk::ImageLayout::GENERAL);
+                dst.acquire_display(cmd);
                 recombine.record(cmd, main_img, aux_img, dst, (w, h), zoom)?;
-                dst.memory_barrier(cmd);
+                dst.release_foreign(cmd);
                 main_img.release_foreign(cmd);
                 if let Some(a) = aux_img {
                     a.release_foreign(cmd);

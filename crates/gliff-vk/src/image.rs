@@ -672,7 +672,19 @@ impl Image {
         self.foreign_barrier(cmd, self.gpu.foreign_family, self.gpu.families.compute, new);
     }
 
-    /// Hand the image to another API (VA-API) to read, contents kept.
+    /// Take an exported display image back from the display side (the
+    /// compositor) before using it, in GENERAL layout; it is handed out again
+    /// with [`Self::release_foreign`]. A fresh image was never handed out.
+    pub(crate) fn acquire_display(&self, cmd: vk::CommandBuffer) {
+        if self.layout.get() == vk::ImageLayout::UNDEFINED {
+            self.transition(cmd, vk::ImageLayout::GENERAL);
+        } else {
+            self.acquire_foreign(cmd, vk::ImageLayout::GENERAL);
+        }
+    }
+
+    /// Hand the image to another API (VA-API, or a compositor for a display
+    /// image) to read, contents kept.
     pub(crate) fn release_foreign(&self, cmd: vk::CommandBuffer) {
         self.foreign_barrier(
             cmd,
