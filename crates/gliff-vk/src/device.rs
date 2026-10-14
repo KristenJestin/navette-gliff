@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use ash::vk;
 
+use crate::image::{writable_display, DISPLAY_USAGE, DISPLAY_VIEW_FORMATS};
 use crate::{Error, Result};
 
 /// Queue family indices.
@@ -228,6 +229,63 @@ impl Gpu {
         format: vk::Format,
         modifier: u64,
     ) -> Option<vk::DrmFormatModifierPropertiesEXT> {
+        self.modifier_list(format)
+            .into_iter()
+            .find(|e| e.drm_format_modifier == modifier)
+    }
+
+    /// The modifiers among `wanted` a display image can take: the recombine
+    /// writes it, the readback copies from it, and it is exported as one
+    /// dmabuf. A display side that cannot read linear images (NVIDIA) passes
+    /// the tiled modifiers it reads.
+    pub(crate) fn display_modifiers(&self, wanted: &[u64]) -> Vec<u64> {
+        let bgra = self.modifier_list(vk::Format::B8G8R8A8_UNORM);
+        let rgba = self.modifier_list(vk::Format::R8G8B8A8_UNORM);
+        wanted
+            .iter()
+            .copied()
+            .filter(|&m| writable_display(m, &bgra, &rgba) && self.exportable_display(m))
+            .collect()
+    }
+
+    /// Whether the driver creates a display image with `modifier` and
+    /// exports it as a dmabuf.
+    fn exportable_display(&self, modifier: u64) -> bool {
+        let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut format_list =
+            vk::ImageFormatListCreateInfo::default().view_formats(&DISPLAY_VIEW_FORMATS);
+        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(DISPLAY_USAGE)
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+            .push_next(&mut drm)
+            .push_next(&mut external)
+            .push_next(&mut format_list);
+        let mut external_props = vk::ExternalImageFormatProperties::default();
+        let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+        // SAFETY: a valid physical device and a fully initialised chain.
+        let supported = unsafe {
+            self.instance.get_physical_device_image_format_properties2(
+                self.physical,
+                &info,
+                &mut props,
+            )
+        };
+        supported.is_ok()
+            && external_props
+                .external_memory_properties
+                .external_memory_features
+                .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
+    }
+
+    /// Every modifier the driver lists for `format`, with its properties.
+    fn modifier_list(&self, format: vk::Format) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
         // SAFETY: two-call pattern on a valid physical device; the list is
         // sized from the first call before the second fills it.
         unsafe {
@@ -244,10 +302,9 @@ impl Gpu {
             let mut props = vk::FormatProperties2::default().push_next(&mut list);
             self.instance
                 .get_physical_device_format_properties2(self.physical, format, &mut props);
+            let count = list.drm_format_modifier_count as usize;
+            entries.truncate(count);
             entries
-                .iter()
-                .find(|e| e.drm_format_modifier == modifier)
-                .copied()
         }
     }
 

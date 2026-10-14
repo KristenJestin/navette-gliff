@@ -18,8 +18,8 @@ use ash::vk;
 
 use crate::compute::{Recombine, Split};
 use crate::device::{Commands, Gpu, Timeline};
-use crate::image::{DmabufPlane, ExportedDmabuf, HostBuffer, Image};
-use crate::Result;
+use crate::image::{DmabufPlane, ExportedDmabuf, HostBuffer, Image, LINEAR_MODIFIER};
+use crate::{Error, Result};
 use gliff_va::{EncoderSettings, H264Decoder, H264Encoder};
 
 pub struct EncodedFrame {
@@ -226,7 +226,8 @@ impl Encoder {
     }
 }
 
-/// A finished display frame: a linear BGRX dmabuf the display side imports.
+/// A finished display frame: a BGRX dmabuf the display side imports, linear
+/// or with one of the modifiers asked for (see [`Decoder::with_modifiers`]).
 /// The fd is a fresh duplicate the receiver owns. Dropping the frame returns
 /// its image to the decoder's ring, so keep it alive until the display side
 /// has finished with the texture.
@@ -265,6 +266,8 @@ pub struct Decoder {
     main: DecodeStream,
     aux: Option<DecodeStream>,
     outputs: Vec<(Image, ExportedDmabuf)>,
+    /// The modifiers the output images may take.
+    modifiers: Vec<u64>,
     /// Counts output rings; a release from an older ring is ignored.
     ring: u64,
     /// Images handed out as `DisplayFrame`s and not yet dropped.
@@ -284,9 +287,40 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    /// A decoder whose display frames are linear.
     pub fn new(gpu: &Arc<Gpu>, dual: bool, width: u32, height: u32) -> Result<Self> {
+        Self::with_output_modifiers(gpu, dual, width, height, vec![LINEAR_MODIFIER])
+    }
+
+    /// A decoder whose display frames take one of `modifiers`, for a display
+    /// side that reads only some layouts (a compositor on NVIDIA lists only
+    /// tiled ones): the device keeps those it can write and export, and
+    /// picks among them. Fails when it can use none.
+    pub fn with_modifiers(
+        gpu: &Arc<Gpu>,
+        dual: bool,
+        width: u32,
+        height: u32,
+        modifiers: &[u64],
+    ) -> Result<Self> {
+        let usable = gpu.display_modifiers(modifiers);
+        if usable.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "the display frames can take none of the modifiers {modifiers:#x?}"
+            )));
+        }
+        Self::with_output_modifiers(gpu, dual, width, height, usable)
+    }
+
+    fn with_output_modifiers(
+        gpu: &Arc<Gpu>,
+        dual: bool,
+        width: u32,
+        height: u32,
+        modifiers: Vec<u64>,
+    ) -> Result<Self> {
         let (release_tx, release_rx) = channel();
-        let outputs = Self::output_ring(gpu, width, height)?;
+        let outputs = Self::output_ring(gpu, width, height, &modifiers)?;
         Ok(Self {
             gpu: gpu.clone(),
             timeline: Timeline::new(gpu)?,
@@ -299,6 +333,7 @@ impl Decoder {
                 None
             },
             outputs,
+            modifiers,
             ring: 0,
             busy: vec![false; DISPLAY_RING],
             handed_out: std::collections::VecDeque::new(),
@@ -316,10 +351,11 @@ impl Decoder {
         gpu: &Arc<Gpu>,
         width: u32,
         height: u32,
+        modifiers: &[u64],
     ) -> Result<Vec<(Image, ExportedDmabuf)>> {
         (0..DISPLAY_RING)
             .map(|_| {
-                let img = Image::exportable_bgra(gpu, width, height)?;
+                let img = Image::exportable_bgra(gpu, width, height, modifiers)?;
                 let dmabuf = img.export_dmabuf()?;
                 Ok((img, dmabuf))
             })
@@ -346,7 +382,12 @@ impl Decoder {
             return Ok(zoom);
         }
         self.compute.wait()?;
-        let outputs = Self::output_ring(&self.gpu, self.width * zoom, self.height * zoom)?;
+        let outputs = Self::output_ring(
+            &self.gpu,
+            self.width * zoom,
+            self.height * zoom,
+            &self.modifiers,
+        )?;
         self.outputs = outputs;
         self.ring += 1;
         self.busy = vec![false; DISPLAY_RING];
