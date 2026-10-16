@@ -1421,6 +1421,7 @@ fn encoder_settings(
         bitrate,
         framerate: fps,
         vbv_ms,
+        max_qp: None,
     }
 }
 

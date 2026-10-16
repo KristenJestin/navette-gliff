@@ -75,6 +75,7 @@ impl H264Encoder {
 
     pub fn new(display: &Arc<Display>, caps: &Caps, settings: EncoderSettings) -> Result<Self> {
         caps.can_encode()?;
+        settings.check_max_qp()?;
         let entrypoint = caps.encode_entrypoint.expect("checked by can_encode");
         let (cw, ch) = (settings.coded_width(), settings.coded_height());
         let (max_w, max_h) = Self::max_coded_extent(caps);
@@ -340,16 +341,7 @@ impl H264Encoder {
 
     fn rate_params(&self) -> Result<Vec<Buffer>> {
         let s = &self.settings;
-        // SAFETY: plain C structs; every field accepts zero.
-        let mut rc: va::VAEncMiscParameterRateControl = unsafe { std::mem::zeroed() };
-        rc.bits_per_second = s.bitrate;
-        rc.target_percentage = 100;
-        rc.window_size = s.vbv_ms;
-        // SAFETY: writing bitfields of a zeroed union member.
-        unsafe {
-            rc.rc_flags.bits.set_disable_frame_skip(1);
-            rc.rc_flags.bits.set_disable_bit_stuffing(1);
-        }
+        let rc = rate_control(s);
         // SAFETY: as above.
         let mut fr: va::VAEncMiscParameterFrameRate = unsafe { std::mem::zeroed() };
         fr.framerate = s.framerate | (1 << 16);
@@ -492,6 +484,23 @@ fn packed_header(
     ])
 }
 
+/// The rate-control parameters for these settings.
+fn rate_control(s: &EncoderSettings) -> va::VAEncMiscParameterRateControl {
+    // SAFETY: plain C structs; every field accepts zero.
+    let mut rc: va::VAEncMiscParameterRateControl = unsafe { std::mem::zeroed() };
+    rc.bits_per_second = s.bitrate;
+    rc.target_percentage = 100;
+    rc.window_size = s.vbv_ms;
+    // Zero leaves the driver's own range.
+    rc.max_qp = s.max_qp.map_or(0, u32::from);
+    // SAFETY: writing bitfields of a zeroed union member.
+    unsafe {
+        rc.rc_flags.bits.set_disable_frame_skip(1);
+        rc.rc_flags.bits.set_disable_bit_stuffing(1);
+    }
+    rc
+}
+
 /// The SPS and PPS this encoder emits: High profile, CABAC, one reference,
 /// POC type 0, cropped to the display size.
 fn parameter_sets(s: &EncoderSettings) -> (Sps, Pps) {
@@ -521,4 +530,39 @@ fn parameter_sets(s: &EncoderSettings) -> (Sps, Pps) {
         ..Default::default()
     };
     (sps, pps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rate_control;
+    use crate::settings::EncoderSettings;
+
+    fn settings(max_qp: Option<u8>) -> EncoderSettings {
+        EncoderSettings {
+            width: 1920,
+            height: 1080,
+            bitrate: 6_000_000,
+            framerate: 30,
+            vbv_ms: 100,
+            max_qp,
+        }
+    }
+
+    #[test]
+    fn rate_control_carries_the_qp_ceiling() {
+        assert_eq!(rate_control(&settings(Some(36))).max_qp, 36);
+    }
+
+    #[test]
+    fn rate_control_leaves_the_driver_range_without_a_ceiling() {
+        assert_eq!(rate_control(&settings(None)).max_qp, 0);
+    }
+
+    #[test]
+    fn rate_control_keeps_the_other_parameters() {
+        let rc = rate_control(&settings(Some(36)));
+        assert_eq!(rc.bits_per_second, 6_000_000);
+        assert_eq!(rc.window_size, 100);
+        assert_eq!(rc.target_percentage, 100);
+    }
 }
