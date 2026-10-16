@@ -1262,6 +1262,7 @@ fn roundtrip(
         bitrate,
         framerate: 60,
         vbv_ms: EncoderSettings::DEFAULT_VBV_MS,
+        max_qp: None,
     };
     let (mut encoder, mut decoder) = match video {
         VideoMode::Gpu => {
@@ -1545,6 +1546,7 @@ fn pipeline(
         bitrate: EncoderSettings::default_bitrate(sw, sh, 60),
         framerate: 60,
         vbv_ms: EncoderSettings::DEFAULT_VBV_MS,
+        max_qp: None,
     };
     let (mut encoder, mut decoder) = match &gpu {
         Some(gpu) => (

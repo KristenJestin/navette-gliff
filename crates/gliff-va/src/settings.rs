@@ -1,5 +1,7 @@
 //! Encoder settings shared by every codec backend.
 
+use crate::{Error, Result};
+
 #[derive(Debug, Clone)]
 pub struct EncoderSettings {
     pub width: u32,
@@ -10,6 +12,9 @@ pub struct EncoderSettings {
     /// Rate control buffer: how far one frame may overshoot the average.
     /// Small on a slow link so a keyframe cannot stall it.
     pub vbv_ms: u32,
+    /// Ceiling on the quantiser (1..=51), so a frame that changes everything
+    /// cannot go very coarse. `None` leaves the driver's own range.
+    pub max_qp: Option<u8>,
 }
 
 impl EncoderSettings {
@@ -19,6 +24,16 @@ impl EncoderSettings {
     pub fn default_bitrate(width: u32, height: u32, framerate: u32) -> u32 {
         // ~0.1 bits per pixel per frame keeps text crisp on a LAN.
         ((width as u64 * height as u64 * framerate as u64) / 10).min(80_000_000) as u32
+    }
+
+    /// Reject a quantiser ceiling outside the range H.264 defines.
+    pub fn check_max_qp(&self) -> Result<()> {
+        match self.max_qp {
+            Some(q) if !(1..=51).contains(&q) => {
+                Err(Error::Unsupported(format!("max_qp {q} is outside 1..=51")))
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn coded_width(&self) -> u32 {
@@ -45,6 +60,30 @@ impl EncoderSettings {
 #[cfg(test)]
 mod tests {
     use super::EncoderSettings;
+
+    fn with_max_qp(max_qp: Option<u8>) -> EncoderSettings {
+        EncoderSettings {
+            width: 1920,
+            height: 1080,
+            bitrate: 6_000_000,
+            framerate: 30,
+            vbv_ms: EncoderSettings::DEFAULT_VBV_MS,
+            max_qp,
+        }
+    }
+
+    #[test]
+    fn max_qp_accepts_none_and_the_whole_h264_range() {
+        assert!(with_max_qp(None).check_max_qp().is_ok());
+        assert!(with_max_qp(Some(1)).check_max_qp().is_ok());
+        assert!(with_max_qp(Some(51)).check_max_qp().is_ok());
+    }
+
+    #[test]
+    fn max_qp_rejects_zero_and_above_51() {
+        assert!(with_max_qp(Some(0)).check_max_qp().is_err());
+        assert!(with_max_qp(Some(52)).check_max_qp().is_err());
+    }
 
     fn coded(v: u32) -> u32 {
         v.div_ceil(16) * 16
