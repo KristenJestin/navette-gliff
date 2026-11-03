@@ -66,7 +66,10 @@ pub struct DmabufPlane<'a> {
 pub struct Image {
     gpu: Arc<Gpu>,
     pub(crate) image: vk::Image,
-    /// One allocation, or one per plane for a disjoint image.
+    /// The UV plane as an image of its own, when the planes are imported
+    /// apart (`Nv12Binding::Split`); `image` then holds the Y plane alone.
+    uv: Option<vk::Image>,
+    /// One allocation, or one per plane for a disjoint or split image.
     memory: Vec<vk::DeviceMemory>,
     pub format: vk::Format,
     pub width: u32,
@@ -119,6 +122,7 @@ impl Image {
         let mut img = Self {
             gpu: gpu.clone(),
             image,
+            uv: None,
             memory: vec![memory],
             format: NV12,
             width,
@@ -205,6 +209,7 @@ impl Image {
         let mut img = Self {
             gpu: gpu.clone(),
             image,
+            uv: None,
             memory: vec![memory],
             format: vk::Format::B8G8R8A8_UNORM,
             width,
@@ -258,6 +263,7 @@ impl Image {
         let mut img = Self {
             gpu: gpu.clone(),
             image,
+            uv: None,
             memory: vec![memory],
             format,
             width,
@@ -357,6 +363,7 @@ impl Image {
         let mut img = Self {
             gpu: gpu.clone(),
             image,
+            uv: None,
             memory: vec![memory],
             format,
             width: plane.width,
@@ -384,11 +391,24 @@ impl Image {
         storage: bool,
     ) -> Result<Self> {
         let plane_objects: Vec<usize> = desc.planes.iter().map(|p| p.object).collect();
+        let mut plane_features = vk::FormatFeatureFlags::SAMPLED_IMAGE;
+        if storage {
+            plane_features |= vk::FormatFeatureFlags::STORAGE_IMAGE;
+        }
+        let splits = [vk::Format::R8_UNORM, vk::Format::R8G8_UNORM]
+            .iter()
+            .all(|&f| {
+                gpu.modifier_properties(f, desc.modifier).is_some_and(|p| {
+                    p.drm_format_modifier_tiling_features
+                        .contains(plane_features)
+                })
+            });
         let binding = nv12_binding(
             desc.objects.len(),
             &plane_objects,
             desc.modifier,
             gpu.modifier_properties(NV12, desc.modifier),
+            splits,
         )?;
         let layouts: Vec<vk::SubresourceLayout> = desc
             .planes
@@ -406,6 +426,9 @@ impl Image {
             | vk::ImageUsageFlags::TRANSFER_DST;
         if storage {
             usage |= vk::ImageUsageFlags::STORAGE;
+        }
+        if binding == Nv12Binding::Split {
+            return Self::import_nv12_split(gpu, desc, usage);
         }
         let families = gpu.families.all();
         let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
@@ -449,10 +472,12 @@ impl Image {
                 &info,
                 [desc.objects[0].as_fd(), desc.objects[1].as_fd()],
             )?,
+            Nv12Binding::Split => unreachable!("imported above"),
         };
         let mut img = Self {
             gpu: gpu.clone(),
             image,
+            uv: None,
             memory,
             format: NV12,
             width: desc.width,
@@ -479,6 +504,100 @@ impl Image {
     }
 
     /// Create `info` and bind it to the dmabuf's memory.
+    /// Import each plane of a surface exported one object per plane as an
+    /// image of its own: R8 for Y, R8G8 for UV, each with a dedicated
+    /// allocation. A disjoint NV12 image packs its planes in one GPU
+    /// address range, and NVIDIA 615 maps the UV plane at the end of the Y
+    /// plane's size, off its 64 KiB page: the mapping fails and the plane
+    /// reads as zeros (a green picture). An allocation of its own is
+    /// aligned.
+    fn import_nv12_split(
+        gpu: &Arc<Gpu>,
+        desc: &PrimeDescriptor,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Self> {
+        let families = gpu.families.all();
+        let plane = |index: usize, format: vk::Format, width: u32, height: u32| {
+            let p = &desc.planes[index];
+            let layouts = [vk::SubresourceLayout {
+                offset: p.offset as u64,
+                size: 0,
+                row_pitch: p.pitch as u64,
+                array_pitch: 0,
+                depth_pitch: 0,
+            }];
+            let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+                .drm_format_modifier(desc.modifier)
+                .plane_layouts(&layouts);
+            let mut external = vk::ExternalMemoryImageCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let mut info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                .usage(usage)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .push_next(&mut explicit)
+                .push_next(&mut external);
+            if families.len() > 1 {
+                info = info
+                    .sharing_mode(vk::SharingMode::CONCURRENT)
+                    .queue_family_indices(&families);
+            }
+            Self::create_imported(gpu, &info, desc.objects[p.object].as_fd())
+        };
+        let (y, y_memory) = plane(0, vk::Format::R8_UNORM, desc.width, desc.height)?;
+        let (uv, uv_memory) =
+            match plane(1, vk::Format::R8G8_UNORM, desc.width / 2, desc.height / 2) {
+                Ok(uv) => uv,
+                Err(e) => {
+                    // SAFETY: the Y image was just made and nothing uses it.
+                    unsafe {
+                        gpu.device.destroy_image(y, None);
+                        gpu.device.free_memory(y_memory, None);
+                    }
+                    return Err(e);
+                }
+            };
+        let mut img = Self {
+            gpu: gpu.clone(),
+            image: y,
+            uv: Some(uv),
+            memory: vec![y_memory, uv_memory],
+            format: NV12,
+            width: desc.width,
+            height: desc.height,
+            layers: 1,
+            layer_views: Vec::new(),
+            plane_views: Vec::new(),
+            layout: vk::ImageLayout::GENERAL.into(),
+        };
+        let plane_usage = usage & (vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED);
+        img.plane_views.push(img.view_of(
+            y,
+            vk::Format::R8_UNORM,
+            vk::ImageAspectFlags::COLOR,
+            0,
+            plane_usage,
+        )?);
+        img.plane_views.push(img.view_of(
+            uv,
+            vk::Format::R8G8_UNORM,
+            vk::ImageAspectFlags::COLOR,
+            0,
+            plane_usage,
+        )?);
+        Ok(img)
+    }
+
     fn create_imported(
         gpu: &Arc<Gpu>,
         info: &vk::ImageCreateInfo,
@@ -564,16 +683,16 @@ impl Image {
     /// Record a plane-by-plane copy of another NV12 image of the same size.
     /// `src` must be in TRANSFER_SRC_OPTIMAL and `self` in TRANSFER_DST_OPTIMAL.
     pub(crate) fn copy_nv12_from(&self, cmd: vk::CommandBuffer, src: &Image) {
-        let region = |aspect: vk::ImageAspectFlags, w: u32, h: u32| vk::ImageCopy {
+        let region = |plane: usize, w: u32, h: u32| vk::ImageCopy {
             src_subresource: vk::ImageSubresourceLayers {
-                aspect_mask: aspect,
+                aspect_mask: src.plane(plane).1,
                 mip_level: 0,
                 base_array_layer: 0,
                 layer_count: 1,
             },
             src_offset: vk::Offset3D::default(),
             dst_subresource: vk::ImageSubresourceLayers {
-                aspect_mask: aspect,
+                aspect_mask: self.plane(plane).1,
                 mip_level: 0,
                 base_array_layer: 0,
                 layer_count: 1,
@@ -586,22 +705,35 @@ impl Image {
             },
         };
         let (w, h) = (self.width.min(src.width), self.height.min(src.height));
-        let regions = [
-            region(vk::ImageAspectFlags::PLANE_0, w, h),
-            region(vk::ImageAspectFlags::PLANE_1, w / 2, h / 2),
-        ];
-        // SAFETY: recording into a command buffer in the recording state;
-        // both images are NV12 with memory bound.
-        unsafe {
-            self.gpu.device.cmd_copy_image(
-                cmd,
-                src.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &regions,
-            );
+        for (plane, (w, h)) in [(w, h), (w / 2, h / 2)].into_iter().enumerate() {
+            // SAFETY: recording into a command buffer in the recording state;
+            // both images are NV12 with memory bound.
+            unsafe {
+                self.gpu.device.cmd_copy_image(
+                    cmd,
+                    src.plane(plane).0,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.plane(plane).0,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region(plane, w, h)],
+                );
+            }
         }
+    }
+
+    /// The image and aspect holding NV12 plane `index` (0 for Y, 1 for UV).
+    fn plane(&self, index: usize) -> (vk::Image, vk::ImageAspectFlags) {
+        match (self.uv, index) {
+            (Some(_), 0) => (self.image, vk::ImageAspectFlags::COLOR),
+            (Some(uv), _) => (uv, vk::ImageAspectFlags::COLOR),
+            (None, 0) => (self.image, vk::ImageAspectFlags::PLANE_0),
+            (None, _) => (self.image, vk::ImageAspectFlags::PLANE_1),
+        }
+    }
+
+    /// Every Vulkan image behind this one: two for a split NV12 import.
+    fn images(&self) -> impl Iterator<Item = vk::Image> {
+        std::iter::once(self.image).chain(self.uv)
     }
 
     /// A view limited to `usage`, which must be a subset of the image's usage:
@@ -614,9 +746,20 @@ impl Image {
         layer: u32,
         usage: vk::ImageUsageFlags,
     ) -> Result<vk::ImageView> {
+        self.view_of(self.image, format, aspect, layer, usage)
+    }
+
+    fn view_of(
+        &self,
+        image: vk::Image,
+        format: vk::Format,
+        aspect: vk::ImageAspectFlags,
+        layer: u32,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<vk::ImageView> {
         let mut usage_info = vk::ImageViewUsageCreateInfo::default().usage(usage);
         let info = vk::ImageViewCreateInfo::default()
-            .image(self.image)
+            .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(format)
             .subresource_range(vk::ImageSubresourceRange {
@@ -650,7 +793,6 @@ impl Image {
             .new_layout(new)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(self.image)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
@@ -658,7 +800,7 @@ impl Image {
                 base_array_layer: 0,
                 layer_count: self.layers,
             });
-        let barriers = [barrier];
+        let barriers: Vec<_> = self.images().map(|i| barrier.image(i)).collect();
         let dep = vk::DependencyInfo::default().image_memory_barriers(&barriers);
         // SAFETY: recording into a command buffer in the recording state.
         unsafe { self.gpu.device.cmd_pipeline_barrier2(cmd, &dep) };
@@ -704,7 +846,6 @@ impl Image {
             .new_layout(new)
             .src_queue_family_index(src)
             .dst_queue_family_index(dst)
-            .image(self.image)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
@@ -712,7 +853,7 @@ impl Image {
                 base_array_layer: 0,
                 layer_count: self.layers,
             });
-        let barriers = [barrier];
+        let barriers: Vec<_> = self.images().map(|i| barrier.image(i)).collect();
         let dep = vk::DependencyInfo::default().image_memory_barriers(&barriers);
         // SAFETY: recording into a command buffer in the recording state.
         unsafe { self.gpu.device.cmd_pipeline_barrier2(cmd, &dep) };
@@ -802,7 +943,9 @@ impl Drop for Image {
             for v in self.plane_views.drain(..).chain(self.layer_views.drain(..)) {
                 self.gpu.device.destroy_image_view(v, None);
             }
-            self.gpu.device.destroy_image(self.image, None);
+            for image in self.images() {
+                self.gpu.device.destroy_image(image, None);
+            }
             for &m in &self.memory {
                 self.gpu.device.free_memory(m, None);
             }
@@ -834,15 +977,20 @@ enum Nv12Binding {
     /// Each plane in its own object (NVIDIA): a disjoint image with one
     /// import per plane.
     Disjoint,
+    /// Each plane in its own object, imported as a single-plane image of
+    /// its own (R8 and R8G8), when the modifier allows them.
+    Split,
 }
 
 /// Choose how to import a surface exported as `objects` dmabuf objects, its
-/// planes in `plane_objects`, given the driver's `props` for `modifier`.
+/// planes in `plane_objects`, given the driver's `props` for `modifier`;
+/// `splits`: each plane can be imported as a single-plane image of its own.
 fn nv12_binding(
     objects: usize,
     plane_objects: &[usize],
     modifier: u64,
     props: Option<vk::DrmFormatModifierPropertiesEXT>,
+    splits: bool,
 ) -> Result<Nv12Binding> {
     if plane_objects.len() != 2 {
         return Err(Error::Unsupported(format!(
@@ -863,6 +1011,7 @@ fn nv12_binding(
     }
     match objects {
         1 => Ok(Nv12Binding::Single),
+        2 if plane_objects == [0, 1] && splits => Ok(Nv12Binding::Split),
         2 if plane_objects == [0, 1] => {
             if props
                 .drm_format_modifier_tiling_features
@@ -1022,20 +1171,54 @@ mod tests {
     #[test]
     fn one_object_surface_takes_the_single_import() {
         for features in [sampled(), disjoint()] {
-            let binding = nv12_binding(1, &[0, 0], NVIDIA_BLOCK_LINEAR, Some(props(2, features)));
+            let binding = nv12_binding(
+                1,
+                &[0, 0],
+                NVIDIA_BLOCK_LINEAR,
+                Some(props(2, features)),
+                true,
+            );
             assert_eq!(binding.unwrap(), Nv12Binding::Single);
         }
     }
 
     #[test]
     fn one_object_per_plane_with_a_disjoint_modifier_imports_each_plane() {
-        let binding = nv12_binding(2, &[0, 1], NVIDIA_BLOCK_LINEAR, Some(props(2, disjoint())));
+        let binding = nv12_binding(
+            2,
+            &[0, 1],
+            NVIDIA_BLOCK_LINEAR,
+            Some(props(2, disjoint())),
+            false,
+        );
         assert_eq!(binding.unwrap(), Nv12Binding::Disjoint);
     }
 
     #[test]
+    fn one_object_per_plane_whose_planes_import_alone_is_split() {
+        // Preferred to the disjoint import, which NVIDIA 615 maps off its
+        // page for the UV plane, so that plane reads as zeros.
+        for features in [sampled(), disjoint()] {
+            let binding = nv12_binding(
+                2,
+                &[0, 1],
+                NVIDIA_BLOCK_LINEAR,
+                Some(props(2, features)),
+                true,
+            );
+            assert_eq!(binding.unwrap(), Nv12Binding::Split);
+        }
+    }
+
+    #[test]
     fn one_object_per_plane_without_disjoint_support_is_refused() {
-        let binding = nv12_binding(2, &[0, 1], NVIDIA_BLOCK_LINEAR, Some(props(2, sampled())));
+        let binding = nv12_binding(
+            2,
+            &[0, 1],
+            NVIDIA_BLOCK_LINEAR,
+            Some(props(2, sampled())),
+            false,
+        );
         assert!(matches!(binding, Err(Error::Unsupported(_))), "{binding:?}");
     }
 
@@ -1043,15 +1226,15 @@ mod tests {
     fn unsupported_layouts_are_refused() {
         let p = Some(props(2, disjoint()));
         for (objects, planes) in [(3, &[0, 1][..]), (2, &[1, 0]), (2, &[0, 0]), (1, &[0])] {
-            let binding = nv12_binding(objects, planes, NVIDIA_BLOCK_LINEAR, p);
+            let binding = nv12_binding(objects, planes, NVIDIA_BLOCK_LINEAR, p, true);
             assert!(
                 matches!(binding, Err(Error::Unsupported(_))),
                 "{objects} objects, planes {planes:?}: {binding:?}"
             );
         }
-        let one_memory_plane = nv12_binding(1, &[0, 0], 0, Some(props(1, sampled())));
+        let one_memory_plane = nv12_binding(1, &[0, 0], 0, Some(props(1, sampled())), true);
         assert!(matches!(one_memory_plane, Err(Error::Unsupported(_))));
-        let unknown_modifier = nv12_binding(2, &[0, 1], NVIDIA_BLOCK_LINEAR, None);
+        let unknown_modifier = nv12_binding(2, &[0, 1], NVIDIA_BLOCK_LINEAR, None, true);
         assert!(matches!(unknown_modifier, Err(Error::Unsupported(_))));
     }
 
