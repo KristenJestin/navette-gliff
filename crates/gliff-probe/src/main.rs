@@ -84,6 +84,10 @@ enum Cmd {
         /// restore it, to exercise the live rate-control update.
         #[arg(long)]
         adapt: bool,
+        /// Encode on the CPU and decode on the GPU, as a desk whose GPU has
+        /// no H.264 encoder (NVIDIA) decodes a remote's stream.
+        #[arg(long)]
+        cpu_encode: bool,
     },
     /// Capture one frame of an output and write it as PNG
     Capture {
@@ -193,7 +197,10 @@ fn main() -> Result<()> {
             single,
             bitrate,
             adapt,
-        } => roundtrip(&node, width, height, frames, !single, bitrate, adapt, video)?,
+            cpu_encode,
+        } => roundtrip(
+            &node, width, height, frames, !single, bitrate, adapt, cpu_encode, video,
+        )?,
         Cmd::Capture {
             output,
             png,
@@ -242,14 +249,34 @@ fn main() -> Result<()> {
                 }
             };
             if gpu_ok && video == VideoMode::Gpu {
-                if let Err(e) = roundtrip(&node, 640, 360, 10, true, None, false, VideoMode::Gpu) {
+                if let Err(e) = roundtrip(
+                    &node,
+                    640,
+                    360,
+                    10,
+                    true,
+                    None,
+                    false,
+                    false,
+                    VideoMode::Gpu,
+                ) {
                     status(
                         false,
                         &format!("GPU round trip failed ({e:#}); the CPU pipeline will be used"),
                     );
                 }
             }
-            roundtrip(&node, 640, 360, 10, true, None, false, VideoMode::Cpu)?;
+            roundtrip(
+                &node,
+                640,
+                360,
+                10,
+                true,
+                None,
+                false,
+                false,
+                VideoMode::Cpu,
+            )?;
         }
     }
     Ok(())
@@ -1253,6 +1280,7 @@ fn roundtrip(
     dual: bool,
     bitrate: Option<u32>,
     adapt: bool,
+    cpu_encode: bool,
     video: VideoMode,
 ) -> Result<()> {
     let bitrate = bitrate.unwrap_or(4 * EncoderSettings::default_bitrate(width, height, 60));
@@ -1268,10 +1296,18 @@ fn roundtrip(
         VideoMode::Gpu => {
             let gpu = Gpu::open(Some(node))?;
             println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
-            (
+            let encoder = if cpu_encode {
+                ProbeEncoder::Cpu(Box::new(
+                    gliff_sw::Encoder::new(sw_settings(width, height, bitrate), dual)
+                        .context("cpu encoder")?,
+                ))
+            } else {
                 ProbeEncoder::Gpu(Box::new(
                     Encoder::new(&gpu, settings, dual).context("vulkan encoder")?,
-                )),
+                ))
+            };
+            (
+                encoder,
                 ProbeDecoder::Gpu(Box::new(
                     Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?,
                 )),
